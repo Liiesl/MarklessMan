@@ -23,6 +23,12 @@ flowchart LR
 
 Pixels outside the detected boxes are copied from the original unchanged.
 
+## Results
+
+![Before (left) vs after (right)](assets/comparison.jpg)
+
+Left: watermarked pages. Right: cleaned with MarklessMan.
+
 ## Repo layout
 
 | Folder | Contents |
