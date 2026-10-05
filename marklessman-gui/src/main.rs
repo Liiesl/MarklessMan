@@ -1,4 +1,5 @@
 mod icons;
+mod models;
 mod theme;
 mod widgets;
 
@@ -177,6 +178,17 @@ enum GuiEvent {
     SetupError(String),
 }
 
+/// One in-flight `fast-down-api` model download (lazy on Run).
+struct ActiveDownload {
+    spec: &'static models::ModelSpec,
+    percent: f32,
+    downloaded: u64,
+    total: u64,
+    progress_rx: Receiver<(f32, u64, u64)>,
+    result_rx: Receiver<Result<PathBuf, String>>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum BackendChoice {
     Cpu,
@@ -223,6 +235,11 @@ struct MarklessApp {
     time_n: usize,
     recent: VecDeque<f32>,
     last_run_secs: Option<f32>,
+    /// Spec ids queued for download (each `&'static ModelSpec` looked up by id).
+    dl_queue: VecDeque<&'static str>,
+    dl_current: Option<ActiveDownload>,
+    dl_error: Option<String>,
+    dl_pending_run: bool,
 }
 
 impl Default for MarklessApp {
@@ -232,8 +249,8 @@ impl Default for MarklessApp {
             selected: None,
             output_dir: PathBuf::from("output"),
             backend: BackendChoice::DirectMl,
-            det_model: PathBuf::from("weights/marklessman-det.onnx"),
-            clean_model: PathBuf::from("weights/marklessman-clean_256_fp32.onnx"),
+            det_model: models::resolve_model_path(&models::DET),
+            clean_model: models::resolve_model_path(&models::CLEAN),
             running: false,
             done: 0,
             total: 0,
@@ -258,6 +275,10 @@ impl Default for MarklessApp {
             time_n: 0,
             recent: VecDeque::new(),
             last_run_secs: None,
+            dl_queue: VecDeque::new(),
+            dl_current: None,
+            dl_error: None,
+            dl_pending_run: false,
         }
     }
 }
@@ -614,8 +635,291 @@ impl MarklessApp {
         }
     }
 
+    fn is_downloading(&self) -> bool {
+        self.dl_current.is_some() || !self.dl_queue.is_empty()
+    }
+
+    fn apply_canonical_if_present(&mut self) {
+        // Adopt AppData files that appeared (e.g. downloaded externally).
+        let det_canon = models::model_path(&models::DET);
+        if !self.det_model.exists() && det_canon.exists() {
+            self.det_model = det_canon;
+        }
+        let clean_canon = models::model_path(&models::CLEAN);
+        if !self.clean_model.exists() && clean_canon.exists() {
+            self.clean_model = clean_canon;
+        }
+    }
+
+    /// Specs that still need downloading for a run (lazy on Run).
+    /// A user-picked override that exists on disk counts as satisfied.
+    fn needed_specs(&mut self) -> Vec<&'static models::ModelSpec> {
+        self.apply_canonical_if_present();
+        let mut out = Vec::new();
+        if !self.det_model.exists() && !models::is_downloaded(&models::DET) {
+            out.push(&models::DET);
+        }
+        if !self.clean_model.exists() && !models::is_downloaded(&models::CLEAN) {
+            out.push(&models::CLEAN);
+        }
+        out
+    }
+
+    fn begin_downloads(&mut self, specs: Vec<&'static models::ModelSpec>, pending_run: bool) {
+        self.dl_error = None;
+        if pending_run {
+            self.dl_pending_run = true;
+        }
+        for s in specs {
+            if self.dl_queue.iter().any(|id| *id == s.id)
+                || self.dl_current.as_ref().is_some_and(|d| d.spec.id == s.id)
+            {
+                continue;
+            }
+            self.dl_queue.push_back(s.id);
+        }
+        if self.dl_current.is_none() {
+            self.pump_download_queue();
+        }
+    }
+
+    fn download_spec(&mut self, spec: &'static models::ModelSpec) {
+        self.begin_downloads(vec![spec], false);
+    }
+
+    fn pump_download_queue(&mut self) {
+        if self.dl_current.is_some() {
+            return;
+        }
+        let Some(id) = self.dl_queue.pop_front() else {
+            return;
+        };
+        let Some(spec) = models::get_model(id) else {
+            return;
+        };
+        let (progress_tx, progress_rx) = mpsc::channel::<(f32, u64, u64)>();
+        let (result_tx, result_rx) = mpsc::channel::<Result<PathBuf, String>>();
+        let cancel = models::spawn_download(spec, progress_tx, result_tx, false);
+        self.dl_current = Some(ActiveDownload {
+            spec,
+            percent: 0.0,
+            downloaded: 0,
+            total: 0,
+            progress_rx,
+            result_rx,
+            cancel,
+        });
+        self.log = format!("downloading {} …", spec.filename);
+    }
+
+    fn poll_downloads(&mut self) {
+        // Drain progress for the active download.
+        if let Some(dl) = self.dl_current.as_mut() {
+            while let Ok((pct, done, total)) = dl.progress_rx.try_recv() {
+                dl.percent = pct;
+                dl.downloaded = done;
+                dl.total = total;
+            }
+        }
+        // Check completion without holding the borrow across queue pumping.
+        let finished: Option<Result<PathBuf, String>> = self
+            .dl_current
+            .as_ref()
+            .and_then(|dl| dl.result_rx.try_recv().ok());
+        let Some(result) = finished else {
+            return;
+        };
+        let dl = self.dl_current.take().expect("polled current");
+        match result {
+            Ok(path) => {
+                if dl.spec.id == models::DET.id {
+                    self.det_model = path.clone();
+                } else if dl.spec.id == models::CLEAN.id {
+                    self.clean_model = path.clone();
+                }
+                self.dl_error = None;
+                self.log = format!("downloaded {}", dl.spec.filename);
+            }
+            Err(e) => {
+                self.dl_error = Some(e.clone());
+                self.log = format!("model download failed: {e}");
+                // Drop the rest of the queue so Retry is explicit.
+                self.dl_queue.clear();
+                self.dl_pending_run = false;
+                return;
+            }
+        }
+        if self.dl_queue.is_empty() {
+            // Re-resolve (legacy + canonical) then continue a pending run.
+            self.apply_canonical_if_present();
+            if self.dl_pending_run {
+                self.dl_pending_run = false;
+                self.start_run();
+            }
+        } else {
+            self.pump_download_queue();
+        }
+    }
+
+    fn cancel_download(&mut self) {
+        if let Some(dl) = self.dl_current.take() {
+            dl.cancel.cancel();
+        }
+        self.dl_queue.clear();
+        self.dl_pending_run = false;
+        self.log = "model download cancelled (resumes next time).".to_string();
+    }
+
+    /// Snapshot of download state for a spec (cloned to avoid borrow fights in UI).
+    fn dl_snapshot(&self, id: &str) -> Option<(f32, u64, u64)> {
+        self.dl_current
+            .as_ref()
+            .filter(|d| d.spec.id == id)
+            .map(|d| (d.percent, d.downloaded, d.total))
+    }
+
+    fn dl_queued(&self, id: &str) -> bool {
+        self.dl_queue.iter().any(|q| *q == id)
+    }
+
+    fn show_model_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        m3: &M3Colors,
+        spec: &'static models::ModelSpec,
+        title: &str,
+        tip: &str,
+    ) {
+        let (model_ok, model_path) = match spec.id {
+            "det" => (self.det_model.exists(), self.det_model.clone()),
+            _ => (self.clean_model.exists(), self.clean_model.clone()),
+        };
+        let active = self.dl_snapshot(spec.id);
+        let queued = self.dl_queued(spec.id);
+        let pick_salt = match spec.id {
+            "det" => "det-pick",
+            _ => "clean-pick",
+        };
+        let icon_salt = match spec.id {
+            "det" => "det-ok",
+            _ => "clean-ok",
+        };
+        ui.horizontal(|ui| {
+            if active.is_some() {
+                ui.spinner();
+            } else {
+                ui.add(icons::tinted(
+                    icon_salt,
+                    if model_ok { icons::CHECK } else { icons::ALERT },
+                    16.0,
+                    if model_ok { m3.success } else { m3.error },
+                ));
+            }
+            ui.label(
+                egui::RichText::new(title)
+                    .size(13.0)
+                    .color(m3.on_surface_variant),
+            )
+            .on_hover_text(tip);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(widgets::trunc_middle(
+                        &model_path.display().to_string(),
+                        48,
+                    ))
+                    .monospace()
+                    .size(12.0)
+                    .color(m3.on_surface_variant),
+                )
+                .truncate(),
+            )
+            .on_hover_text(model_path.display().to_string());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::icon_button(
+                    ui,
+                    icons::tinted(pick_salt, icons::FOLDER, 18.0, m3.primary),
+                    &format!("Choose {title} model (.onnx)"),
+                )
+                .clicked()
+                    && let Some(p) = rfd::FileDialog::new()
+                        .add_filter("onnx", &["onnx"])
+                        .pick_file()
+                {
+                    match spec.id {
+                        "det" => self.det_model = p,
+                        _ => self.clean_model = p,
+                    }
+                    self.dl_error = None;
+                }
+                if active.is_some() {
+                    if widgets::icon_button(
+                        ui,
+                        icons::tinted("dl-cancel", icons::X, 18.0, m3.error),
+                        "Cancel download (resumes next time)",
+                    )
+                    .clicked()
+                    {
+                        self.cancel_download();
+                    }
+                } else if !model_ok && !queued {
+                    if widgets::icon_button(
+                        ui,
+                        icons::tinted("dl-start", icons::DOWNLOAD, 18.0, m3.primary),
+                        &format!("Download {} from Hugging Face", spec.filename),
+                    )
+                    .clicked()
+                    {
+                        self.download_spec(spec);
+                    }
+                }
+            });
+        });
+        if let Some((pct, done, total)) = active {
+            let frac = (pct / 100.0).clamp(0.0, 1.0);
+            ui.horizontal(|ui| {
+                ui.add_space(24.0);
+                let bar = egui::ProgressBar::new(frac)
+                    .show_percentage()
+                    .text(format!(
+                        "downloading {} • {} / {}",
+                        spec.filename,
+                        fmt_size(done),
+                        if total > 0 {
+                            fmt_size(total)
+                        } else {
+                            "…".to_string()
+                        }
+                    ))
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .desired_width(ui.available_width().max(80.0));
+                ui.add(bar);
+            });
+        } else if queued {
+            ui.horizontal(|ui| {
+                ui.add_space(24.0);
+                ui.label(
+                    egui::RichText::new("queued for download…")
+                        .size(12.0)
+                        .color(m3.on_surface_variant),
+                );
+            });
+        } else if !model_ok {
+            ui.horizontal(|ui| {
+                ui.add_space(24.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "missing — auto-downloads on Run from Hugging Face into {}",
+                        models::models_dir().display()
+                    ))
+                    .size(11.5)
+                    .color(m3.error),
+                );
+            });
+        }
+    }
+
     fn start_run(&mut self) {
-        if self.running || self.items.is_empty() {
+        if self.running || self.is_downloading() || self.items.is_empty() {
             return;
         }
         if !self.output_chosen {
@@ -627,6 +931,15 @@ impl MarklessApp {
                 return;
             }
         }
+        // Lazy model resolving: download missing AppData models first.
+        let needed = self.needed_specs();
+        if !needed.is_empty() {
+            let names: Vec<&str> = needed.iter().map(|s| s.filename).collect();
+            self.log = format!("models missing, downloading: {}", names.join(", "));
+            self.show_advanced = true;
+            self.begin_downloads(needed, true);
+            return;
+        }
         if !self.det_model.exists() {
             self.log = format!("detector not found: {}", self.det_model.display());
             return;
@@ -635,6 +948,10 @@ impl MarklessApp {
             self.log = format!("cleaner not found: {}", self.clean_model.display());
             return;
         }
+        self.start_pipeline();
+    }
+
+    fn start_pipeline(&mut self) {
         if let Err(e) = std::fs::create_dir_all(&self.output_dir) {
             self.log = format!("cannot create output dir: {e}");
             return;
@@ -769,13 +1086,18 @@ impl MarklessApp {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.running {
+            if self.is_downloading() {
+                self.cancel_download();
+            } else if self.running {
                 self.cancel_run();
             } else if self.preview_open {
                 self.preview_open = false;
             }
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !self.running && !self.items.is_empty()
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter))
+            && !self.running
+            && !self.is_downloading()
+            && !self.items.is_empty()
         {
             self.start_run();
         }
@@ -884,7 +1206,8 @@ impl eframe::App for MarklessApp {
         let m3 = theme::colors(self.dark_mode);
         self.ingest_dropped(&ctx);
         self.poll_events();
-        if self.running {
+        self.poll_downloads();
+        if self.running || self.is_downloading() {
             ctx.request_repaint();
         }
         self.handle_shortcuts(&ctx);
@@ -922,6 +1245,21 @@ impl eframe::App for MarklessApp {
                         .clicked()
                         {
                             self.cancel_run();
+                        }
+                    } else if self.is_downloading() {
+                        if widgets::filled_button(
+                            ui,
+                            "stop-dl",
+                            icons::X,
+                            "Cancel",
+                            m3.error,
+                            m3.on_error,
+                            "Cancel model download (Esc, resumes next time)",
+                            egui::vec2(112.0, 40.0),
+                        )
+                        .clicked()
+                        {
+                            self.cancel_download();
                         }
                     } else {
                         let run_enabled = !self.items.is_empty();
@@ -1155,103 +1493,72 @@ impl eframe::App for MarklessApp {
                             });
                     });
                     ui.add_space(4.0);
-                    {
-                        let det_ok = self.det_model.exists();
-                        ui.horizontal(|ui| {
-                            ui.add(icons::tinted(
-                                "det-ok",
-                                if det_ok { icons::CHECK } else { icons::ALERT },
-                                16.0,
-                                if det_ok { m3.success } else { m3.error },
-                            ));
-                            ui.label(
-                                egui::RichText::new("Detector")
-                                    .size(13.0)
-                                    .color(m3.on_surface_variant),
-                            )
-                            .on_hover_text("Detector ONNX model");
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(widgets::trunc_middle(
-                                        &self.det_model.display().to_string(),
-                                        60,
-                                    ))
-                                    .monospace()
-                                    .size(12.0)
-                                    .color(m3.on_surface_variant),
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Models")
+                                .size(13.0)
+                                .strong()
+                                .color(m3.on_surface),
+                        )
+                        .on_hover_text(format!(
+                            "Hugging Face models cached in {}",
+                            models::models_dir().display()
+                        ));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if widgets::icon_button(
+                                    ui,
+                                    icons::tinted(
+                                        "models-folder",
+                                        icons::FOLDER_OPEN,
+                                        18.0,
+                                        m3.primary,
+                                    ),
+                                    &format!("Open {}", models::models_dir().display()),
                                 )
-                                .truncate(),
-                            )
-                            .on_hover_text(self.det_model.display().to_string());
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if widgets::icon_button(
-                                        ui,
-                                        icons::tinted("det-pick", icons::FOLDER, 18.0, m3.primary),
-                                        "Choose detector model (.onnx)",
-                                    )
-                                    .clicked()
-                                        && let Some(p) = rfd::FileDialog::new()
-                                            .add_filter("onnx", &["onnx"])
-                                            .pick_file()
-                                    {
-                                        self.det_model = p;
-                                    }
-                                },
-                            );
-                        });
-                    }
-                    {
-                        let clean_ok = self.clean_model.exists();
+                                .clicked()
+                                {
+                                    let dir = models::ensure_models_dir()
+                                        .unwrap_or_else(|_| models::models_dir());
+                                    reveal_in_folder(&dir.join("_.tmp"));
+                                }
+                            },
+                        );
+                    });
+                    self.show_model_row(
+                        ui,
+                        &m3,
+                        &models::DET,
+                        "Detector",
+                        "Detector ONNX model",
+                    );
+                    self.show_model_row(
+                        ui,
+                        &m3,
+                        &models::CLEAN,
+                        "Cleaner",
+                        "Cleaner ONNX model",
+                    );
+                    if let Some(err) = self.dl_error.clone() {
                         ui.horizontal(|ui| {
-                            ui.add(icons::tinted(
-                                "clean-ok",
-                                if clean_ok { icons::CHECK } else { icons::ALERT },
-                                16.0,
-                                if clean_ok { m3.success } else { m3.error },
-                            ));
+                            ui.add_space(24.0);
                             ui.label(
-                                egui::RichText::new("Cleaner")
-                                    .size(13.0)
-                                    .color(m3.on_surface_variant),
-                            )
-                            .on_hover_text("Cleaner ONNX model");
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(widgets::trunc_middle(
-                                        &self.clean_model.display().to_string(),
-                                        60,
-                                    ))
-                                    .monospace()
+                                egui::RichText::new(format!("download failed: {err}"))
                                     .size(12.0)
-                                    .color(m3.on_surface_variant),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(self.clean_model.display().to_string());
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if widgets::icon_button(
-                                        ui,
-                                        icons::tinted(
-                                            "clean-pick",
-                                            icons::FOLDER,
-                                            18.0,
-                                            m3.primary,
-                                        ),
-                                        "Choose cleaner model (.onnx)",
-                                    )
-                                    .clicked()
-                                        && let Some(p) = rfd::FileDialog::new()
-                                            .add_filter("onnx", &["onnx"])
-                                            .pick_file()
-                                    {
-                                        self.clean_model = p;
-                                    }
-                                },
+                                    .color(m3.error),
                             );
+                            if ui
+                                .small_button("Retry")
+                                .on_hover_text("Retry failed download")
+                                .clicked()
+                            {
+                                self.dl_error = None;
+                                let needed = self.needed_specs();
+                                if !needed.is_empty() {
+                                    self.begin_downloads(needed, self.dl_pending_run);
+                                }
+                            }
                         });
                     }
                 });
@@ -1262,11 +1569,34 @@ impl eframe::App for MarklessApp {
         // ── M3 bottom bar: linear progress + log ─────────────────
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.add_space(4.0);
-            let frac = if self.total > 0 {
-                (self.done as f32 / self.total as f32).clamp(0.0, 1.0)
+            // Model download takes over the progress slot while active (lazy on Run).
+            if let Some(dl) = self.dl_current.as_ref() {
+                let frac = (dl.percent / 100.0).clamp(0.0, 1.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    let text = format!(
+                        "downloading {} • {} / {}",
+                        dl.spec.filename,
+                        fmt_size(dl.downloaded),
+                        if dl.total > 0 {
+                            fmt_size(dl.total)
+                        } else {
+                            "…".to_string()
+                        }
+                    );
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .show_percentage()
+                            .text(text)
+                            .corner_radius(egui::CornerRadius::same(4)),
+                    );
+                });
             } else {
-                0.0
-            };
+                let frac = if self.total > 0 {
+                    (self.done as f32 / self.total as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
             ui.horizontal(|ui| {
                 let denom = self.total.max(self.items.len());
                 widgets::pill(
@@ -1304,18 +1634,23 @@ impl eframe::App for MarklessApp {
                     );
                 }
             });
+            }
             ui.horizontal(|ui| {
+                let downloading = self.dl_current.is_some();
                 let (icon_bytes, icon_name, color) =
-                    if self.log.starts_with("error") || self.log.starts_with("setup failed") {
+                    if self.log.starts_with("error")
+                        || self.log.starts_with("setup failed")
+                        || self.log.starts_with("model download failed")
+                    {
                         (icons::ALERT, "log-err", m3.error)
                     } else if self.log.starts_with("done:") {
                         (icons::CHECK, "log-ok", m3.success)
-                    } else if self.running {
+                    } else if self.running || downloading {
                         (icons::LOADER, "log-run", m3.primary)
                     } else {
                         (icons::CLOCK, "log-idle", m3.outline)
                     };
-                if self.running {
+                if self.running || downloading {
                     ui.spinner();
                 } else {
                     ui.add(icons::tinted(icon_name, icon_bytes, 16.0, color));
