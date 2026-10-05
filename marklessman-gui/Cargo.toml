@@ -3,6 +3,10 @@ name = "marklessman-gui"
 edition = "2024"
 version.workspace = true
 
+[features]
+default = ["updates"]
+updates = ["dep:velopack"]
+
 [dependencies]
 dirs = "6"
 eframe = "0.36"
@@ -14,3 +18,7 @@ rfd = "0.17"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tokio-util = "0.7"
 url = "2"
+velopack = { version = "1.2", optional = true }
+
+[build-dependencies]
+winres = "0.1"

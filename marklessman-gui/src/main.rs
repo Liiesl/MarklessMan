@@ -1,12 +1,15 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod icons;
 mod models;
 mod theme;
+mod updater;
 mod widgets;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver},
 };
@@ -17,7 +20,30 @@ use marklessman_core::{Backend, Cleaner, Detector, Pipeline, SessionOptions, is_
 
 use theme::M3Colors;
 
+#[cfg(all(windows, feature = "updates"))]
+use velopack::VelopackApp;
+
 fn main() -> eframe::Result<()> {
+    // ---- Velopack lifecycle (handles install/update/uninstall and exits) ----
+    #[cfg(all(windows, feature = "updates"))]
+    VelopackApp::build().run();
+
+    // Silent auto-update: check once shortly after startup and download
+    // immediately when available; the staged update is applied on close
+    // via `on_exit` (no UI, no prompts).
+    let pending_update: Arc<Mutex<Option<updater::UpdateInfo>>> =
+        Arc::new(Mutex::new(None));
+    #[cfg(feature = "updates")]
+    {
+        let pending_w = pending_update.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            if let Some(info) = updater::check_and_download() {
+                *pending_w.lock().expect("update lock") = Some(info);
+            }
+        });
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 680.0])
@@ -27,11 +53,15 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "MarklessMan",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
             theme::install_cjk_fallback(&cc.egui_ctx);
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(MarklessApp::default()))
+            Ok(Box::new({
+                let mut app = MarklessApp::default();
+                app.pending_update = pending_update.clone();
+                app
+            }))
         }),
     )
 }
@@ -241,6 +271,8 @@ struct MarklessApp {
     dl_current: Option<ActiveDownload>,
     dl_error: Option<String>,
     dl_pending_run: bool,
+    /// Update staged by the silent background check; applied on close.
+    pending_update: Arc<Mutex<Option<updater::UpdateInfo>>>,
 }
 
 impl Default for MarklessApp {
@@ -280,6 +312,7 @@ impl Default for MarklessApp {
             dl_current: None,
             dl_error: None,
             dl_pending_run: false,
+            pending_update: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -2068,6 +2101,19 @@ impl eframe::App for MarklessApp {
                     self.hover_row = hover_row;
                 });
         });
+    }
+
+    fn on_exit(&mut self) {
+        // Auto-apply a staged update on close: hands off to Velopack's
+        // Update.exe (silent, no restart); the next launch runs the new version.
+        let staged = self
+            .pending_update
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(None);
+        if let Some(info) = staged.as_ref() {
+            updater::apply_on_exit(info);
+        }
     }
 }
 

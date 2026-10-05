@@ -1,0 +1,60 @@
+name: Build & Package Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-package:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install vpk
+        run: dotnet tool install -g vpk
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Build release
+        shell: bash
+        run: |
+          export VELPK_VERSION="${{ steps.version.outputs.VERSION }}"
+          export VPK_PACK_VERSION="${{ steps.version.outputs.VERSION }}"
+          export VERSION="${{ steps.version.outputs.VERSION }}"
+          cargo build --release -p marklessman-gui
+
+      - name: Stage files
+        shell: pwsh
+        run: |
+          if (Test-Path staging) { Remove-Item -Recurse -Force staging }
+          New-Item -ItemType Directory -Path staging | Out-Null
+          Copy-Item target/release/marklessman-gui.exe staging/
+
+      - name: Create Velopack Release
+        shell: bash
+        run: |
+          # Download prior release for delta generation (ignore failure on first release)
+          vpk download github --repoUrl https://github.com/Liiesl/MarklessMan --token ${{ secrets.GITHUB_TOKEN }} || true
+          vpk pack -u MarklessMan -v ${{ steps.version.outputs.VERSION }} -p ./staging -e marklessman-gui.exe --packTitle MarklessMan --packAuthors Liie
+
+      - name: Upload to GitHub
+        shell: bash
+        run: |
+          vpk upload github --repoUrl https://github.com/Liiesl/MarklessMan --tag v${{ steps.version.outputs.VERSION }} --token ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

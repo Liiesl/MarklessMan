@@ -8,3 +8,10 @@ Shimu WMs/
 SLBR-Visible-Watermark-Removal/
 marklessman-slbr.log
 output/
+# Velopack
+/Releases
+/staging
+*.nupkg
+RELEASES
+releases.*.json
+assets.*.json
