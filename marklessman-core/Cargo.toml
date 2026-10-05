@@ -1,0 +1,13 @@
+[package]
+name = "marklessman-core"
+version.workspace = true
+edition.workspace = true
+description = "Watermark detection and removal pipeline built on ONNX Runtime"
+
+[dependencies]
+ort.workspace = true
+image.workspace = true
+ndarray.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+wide.workspace = true

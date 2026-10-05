@@ -1,0 +1,15 @@
+[package]
+name = "marklessman-lab"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mm-lab"
+path = "src/main.rs"
+
+[dependencies]
+ort.workspace = true
+image.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+ndarray.workspace = true

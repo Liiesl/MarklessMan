@@ -1,0 +1,11 @@
+[package]
+name = "marklessman-gui"
+edition = "2024"
+version.workspace = true
+
+[dependencies]
+eframe = "0.36"
+egui_extras = { version = "0.36", features = ["all_loaders"] }
+image.workspace = true
+marklessman-core = { version = "0.1", path = "../marklessman-core" }
+rfd = "0.17"
