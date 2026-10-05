@@ -29,6 +29,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
+            theme::install_cjk_fallback(&cc.egui_ctx);
             egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(MarklessApp::default()))
         }),

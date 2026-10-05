@@ -258,3 +258,124 @@ pub fn set_dark(ctx: &egui::Context, dark: bool) {
         egui::ThemePreference::Light
     });
 }
+
+/// Install a system CJK fallback font so CJK file paths render instead of tofu.
+///
+/// `egui`'s bundled fonts (Hack / Ubuntu-Light) have no CJK glyphs. This
+/// probes well-known OS CJK fonts, loads the first few found, and appends
+/// them as lowest-priority fallbacks to both Proportional and Monospace
+/// families (queue paths use `.monospace()`). No new deps, no binary bloat.
+///
+/// Returns the number of fallback fonts registered (0 when none found).
+pub fn install_cjk_fallback(ctx: &egui::Context) -> usize {
+    use std::sync::Arc;
+
+    let candidates = cjk_candidates();
+    let mut loaded: Vec<(String, egui::FontData)> = Vec::new();
+
+    for path in candidates {
+        if loaded.len() >= 2 {
+            break;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("cjk")
+            .to_string();
+        // Note: for `.ttc` collections index 0 is the regular weight, which is
+        // what we want for UI fallback. Invalid indices yield no glyphs, so
+        // stick to 0 rather than registering every face.
+        loaded.push((
+            format!("cjk-{stem}"),
+            egui::FontData::from_owned(bytes),
+        ));
+    }
+
+    if loaded.is_empty() {
+        eprintln!("marklessman: no system CJK font found, CJK paths may show tofu");
+        return 0;
+    }
+
+    let count = loaded.len();
+    let mut defs = egui::FontDefinitions::default();
+    for (name, data) in loaded {
+        defs.font_data.insert(name.clone(), Arc::new(data));
+        if let Some(fam) = defs.families.get_mut(&egui::FontFamily::Proportional) {
+            fam.push(name.clone());
+        }
+        if let Some(fam) = defs.families.get_mut(&egui::FontFamily::Monospace) {
+            fam.push(name);
+        }
+    }
+    ctx.set_fonts(defs);
+    count
+}
+
+/// Well-known system CJK font locations, highest-priority first.
+fn cjk_candidates() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let mut out: Vec<PathBuf> = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let fonts = PathBuf::from(windir).join("Fonts");
+        for f in [
+            // Simplified-first: YaHei regular covers CJK Unified Ideographs.
+            "msyh.ttc",
+            "simhei.ttf",
+            "simsun.ttc",
+            // Traditional / fallback.
+            "msjh.ttc",
+            "mingliu.ttc",
+        ] {
+            out.push(fonts.join(f));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        for f in [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/Library/Fonts/Noto Sans CJK SC.ttc",
+        ] {
+            out.push(PathBuf::from(f));
+        }
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        for f in [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.ttf",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        ] {
+            out.push(PathBuf::from(f));
+        }
+        // Also probe Windows fonts dir under Wine/dual-boot, harmless elsewhere.
+        if let Ok(windir) = std::env::var("WINDIR") {
+            let fonts = PathBuf::from(windir).join("Fonts");
+            for f in ["msyh.ttc", "simhei.ttf", "simsun.ttc"] {
+                out.push(fonts.join(f));
+            }
+        }
+    }
+
+    // User override: drop any TTF/OTF/TTC at this path to force it first.
+    if let Some(dir) = dirs::config_dir() {
+        out.insert(0, dir.join("marklessman").join("cjk-fallback.ttf"));
+    }
+
+    out
+}
